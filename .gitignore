@@ -1,0 +1,9 @@
+.venv/
+.idea/
+temp_data/
+__pycache__/
+*.log
+data/
+config.py
+*.html
+temp_data/
