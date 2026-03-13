@@ -33,23 +33,26 @@ FOREX_CONTRACT = Forex('USDCNH')
 # ===============================================
 
 BASE_DATA = {
-    'NAV_DATE': None,  # 净值日期 (锚点)
-    'MES_CLOSE': None,  # 该日期的 MES 收盘价
-    'FX_CLOSE': None,  # 该日期的 汇率 收盘价
-    'CANDIDATE_DATES': None,  # 共同交易日候选列表 (从新到旧，YYYY-MM-DD)
+    'NAV_DATE': None,        # 净值日期 (锚点)
+    'MES_CLOSE': None,       # 该日期的 MES 收盘价
+    'FX_CLOSE': None,        # 该日期的 汇率 收盘价
+    'CANDIDATE_DATES': None, # 共同交易日候选列表 (从新到旧，YYYY-MM-DD)
     'BASELINE_READY': False  # IB 线程基准数据是否就绪
 }
 
 REALTIME_DATA = {
     'MES': None,
+    'MES_TS': 0.0,  # MES 最近更新时间戳
     'FX': None,
+    'FX_TS': 0.0,   # FX 最近更新时间戳
     'ETFS': {}
 }
 
 ERROR_STATE = {
     'active': False,
     'message': '',
-    'last_notify_ts': 0.0
+    'last_notify_ts': 0.0,
+    'first_seen_ts': 0.0  # 首次发现当前错误的时间，用于“持续超过 N 秒”判定
 }
 
 # 估值摘要推送状态（独立于错误告警）
@@ -60,28 +63,65 @@ PREMIUM_STATE = {
 # 错误告警发送间隔（秒）
 ERROR_NOTIFY_INTERVAL = 300
 
- # 估值摘要发送间隔（秒，可调）
+# 估值摘要发送间隔（秒，可调）
 PREMIUM_NOTIFY_INTERVAL = 300
+
+# 行情心跳超时阈值（秒）
+MES_FX_STALE_TIMEOUT = 30     # MES / FX 超过该秒数无更新 => 认为 IB 通讯异常
+ETF_STALE_TIMEOUT = 60        # 单只 ETF 超过该秒数无 tick => 认为 QMT 该标的行情异常
 
 
 def set_error(message: str):
-    ERROR_STATE['active'] = True
-    ERROR_STATE['message'] = message or ""
+    """
+    设置阻断性错误状态。
+    - 首次进入错误状态或错误信息变化时，重置 first_seen_ts，用于后续“持续超过 N 秒”的告警触发。
+    - 进入错误状态时，同时重置估值摘要节流计时器，保证故障恢复后能第一时间推送最新正常数据。
+    """
+    now = time.time()
+    new_msg = message or ""
+    if not ERROR_STATE['active']:
+        ERROR_STATE['active'] = True
+        ERROR_STATE['message'] = new_msg
+        ERROR_STATE['first_seen_ts'] = now
+        ERROR_STATE['last_notify_ts'] = 0.0
+        PREMIUM_STATE['last_notify_ts'] = 0.0
+    else:
+        # 如果错误类型/文案发生变化，视为新的错误事件，重新计时
+        if ERROR_STATE['message'] != new_msg:
+            ERROR_STATE['message'] = new_msg
+            ERROR_STATE['first_seen_ts'] = now
+            ERROR_STATE['last_notify_ts'] = 0.0
+            PREMIUM_STATE['last_notify_ts'] = 0.0
     print(f"❌ [ERROR] {ERROR_STATE['message']}")
 
 
 def clear_error():
     if ERROR_STATE['active']:
+        # 恢复时立即推送一次“恢复正常”通知
+        recover_msg = f"故障已恢复，系统恢复正常计算。上一次错误：{ERROR_STATE['message']}"
         print("✅ [ERROR] 关键数据已恢复，退出错误状态。")
+        notifier.send_dingtalk_msg(recover_msg)
+        notifier.send_ntfy_msg(recover_msg)
     ERROR_STATE['active'] = False
     ERROR_STATE['message'] = ""
+    ERROR_STATE['last_notify_ts'] = 0.0
+    ERROR_STATE['first_seen_ts'] = 0.0
 
 
 def maybe_notify_error():
-    """按固定间隔将当前错误发送到钉钉（若已配置）"""
+    """
+    按策略将当前错误发送到钉钉/手机（若已配置）：
+    - 错误首次出现后先观察 30s，若在此期间恢复则不推送（过滤瞬时抖动）；
+    - 持续超过 30s 仍未恢复，则立即推送一次；
+    - 之后按 ERROR_NOTIFY_INTERVAL 节流重复推送，直到错误解除。
+    """
     if not ERROR_STATE['active'] or not ERROR_STATE['message']:
         return
     now = time.time()
+    first_ts = ERROR_STATE.get('first_seen_ts') or 0.0
+    # 错误持续时间不足 30 秒，不推送（视为待确认期）
+    if first_ts and (now - first_ts < 30):
+        return
     if now - ERROR_STATE['last_notify_ts'] < ERROR_NOTIFY_INTERVAL:
         return
     ERROR_STATE['last_notify_ts'] = now
@@ -124,7 +164,11 @@ def maybe_notify_premium_snapshot(baseline_date: str, mes_curr: float, fx_curr: 
     notifier.send_ntfy_msg(content)
 
 for code in ETF_LIST:
-    REALTIME_DATA['ETFS'][code] = {'price': None, 'nav': None}
+    REALTIME_DATA['ETFS'][code] = {
+        'price': None,
+        'nav': None,
+        'last_update_ts': 0.0  # QMT 该标的最近更新时间戳
+    }
 
 
 def get_historical_baseline(ib: IB, target_date_str):
@@ -211,16 +255,23 @@ def ib_loop():
 
         def on_pending_tickers(tickers):
             for t in tickers:
+                # 若 MES / FX 仍为空，打印有限的调试信息，帮助确认 IB 是否有推行情
+                if REALTIME_DATA['MES'] is None or REALTIME_DATA['FX'] is None:
+                    print(f"[IB线程][TICK] contract={t.contract}, last={t.last}, marketPrice={t.marketPrice()}")
+
                 if t.contract.conId == MES_CONTRACT.conId:
                     # 优先取 Last (防CME故障)
                     price = t.last if (t.last and t.last > 0) else t.marketPrice()
                     if price and price > 0:
                         REALTIME_DATA['MES'] = price
+                        REALTIME_DATA['MES_TS'] = time.time()
 
-                elif t.contract.symbol == 'USD':
+                # 使用 conId 精确匹配 USDCNH 合约，避免仅按 symbol 判断带来的错配
+                elif t.contract.conId == FOREX_CONTRACT.conId:
                     price = t.marketPrice()
                     if price and price > 0:
                         REALTIME_DATA['FX'] = price
+                        REALTIME_DATA['FX_TS'] = time.time()
 
         ib.pendingTickersEvent += on_pending_tickers
         ib.run()
@@ -332,7 +383,9 @@ def main_monitor():
                     if code in tick:
                         price = tick[code].get('lastPrice')
                         if not price or price == 0: price = tick[code].get('lastClose')
-                        if price: REALTIME_DATA['ETFS'][code]['price'] = price
+                        if price:
+                            REALTIME_DATA['ETFS'][code]['price'] = price
+                            REALTIME_DATA['ETFS'][code]['last_update_ts'] = time.time()
 
             # 计算前检查关键数据是否齐全
             mes_curr = REALTIME_DATA['MES']
@@ -340,6 +393,7 @@ def main_monitor():
             mes_base = BASE_DATA['MES_CLOSE']
             fx_base = BASE_DATA['FX_CLOSE']
 
+            # 1) 基础空值检查（包括启动阶段）
             if not (mes_curr and fx_curr and mes_base and fx_base):
                 set_error(f"基准/实时数据缺失：MES={mes_curr}, FX={fx_curr}, MES_CLOSE={mes_base}, FX_CLOSE={fx_base}")
                 maybe_notify_error()
@@ -347,22 +401,54 @@ def main_monitor():
                 time.sleep(3)
                 continue
 
-            # 检查每只 ETF 的价格和 NAV 是否齐全
+            # 2) MES / FX 心跳超时检查（通讯层面故障）
+            now_ts = time.time()
+            mes_ts = REALTIME_DATA.get('MES_TS') or 0.0
+            fx_ts = REALTIME_DATA.get('FX_TS') or 0.0
+            stale_reasons = []
+            if now_ts - mes_ts > MES_FX_STALE_TIMEOUT:
+                stale_reasons.append(f"MES 超过 {MES_FX_STALE_TIMEOUT}s 未更新 (最后: {time.strftime('%H:%M:%S', time.localtime(mes_ts)) if mes_ts else '从未更新'})")
+            if now_ts - fx_ts > MES_FX_STALE_TIMEOUT:
+                stale_reasons.append(f"FX 超过 {MES_FX_STALE_TIMEOUT}s 未更新 (最后: {time.strftime('%H:%M:%S', time.localtime(fx_ts)) if fx_ts else '从未更新'})")
+            if stale_reasons:
+                msg = "IB 行情心跳超时：" + "；".join(stale_reasons)
+                set_error(msg)
+                maybe_notify_error()
+                print(f"⏳ 等待 IB 行情恢复... {msg}")
+                time.sleep(3)
+                continue
+
+            # 3) 检查每只 ETF 的价格和 NAV 是否齐全 & 心跳是否超时
             missing_etfs = []
+            stale_etfs = []
             etf_snapshot = []
             for code in ETF_LIST:
                 data = REALTIME_DATA['ETFS'][code]
                 price = data['price']
                 nav = data['nav']
-                if price and nav:
-                    etf_snapshot.append((code, price, nav))
-                else:
-                    missing_etfs.append(code)
+                last_ts = data.get('last_update_ts') or 0.0
 
-            if missing_etfs:
-                set_error(f"以下 ETF 缺少价格或净值，无法计算溢价率: {', '.join(missing_etfs)}")
+                if not (price and nav):
+                    missing_etfs.append(code)
+                    continue
+
+                # 心跳超时：有价格 & NAV，但长时间无新 tick，判定为行情通讯异常
+                if now_ts - last_ts > ETF_STALE_TIMEOUT:
+                    stale_etfs.append(code)
+                    continue
+
+                etf_snapshot.append((code, price, nav))
+
+            if missing_etfs or stale_etfs:
+                reasons = []
+                if missing_etfs:
+                    reasons.append(f"缺少价格或净值: {', '.join(missing_etfs)}")
+                if stale_etfs:
+                    reasons.append(f"行情心跳超时(>{ETF_STALE_TIMEOUT}s 未更新): {', '.join(stale_etfs)}")
+                msg = "以下 ETF 数据异常，无法计算溢价率：" + "；".join(reasons)
+                set_error(msg)
                 maybe_notify_error()
-                print(f"⏳ 等待 ETF 数据补全... 缺失标的: {', '.join(missing_etfs)}")
+                print(f"⏳ 等待 ETF 数据恢复... {msg}")
                 time.sleep(3)
                 continue
 
@@ -408,7 +494,11 @@ def main_monitor():
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"错误: {e}")
+            # 运行时异常统一纳入错误状态与告警通道，避免只在控制台打印
+            err_msg = f"主循环异常: {e}"
+            print(err_msg)
+            set_error(err_msg)
+            maybe_notify_error()
             time.sleep(3)
 
 
