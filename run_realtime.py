@@ -18,7 +18,7 @@ import utils_contract
 import notifier
 
 # ================= ⚙️ 配置区域 =================
-IB_PORT = 4001
+IB_PORT = 4003
 IB_CLIENT_ID = 100
 DATA_MODE = 1  # 1=实时, 4=周末测试
 
