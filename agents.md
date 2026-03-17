@@ -161,6 +161,9 @@ $$\text{Fair Value} = \text{NAV}_{date} \times \left( \frac{\text{MES}_{realtime
     * **Fix**: 检查 TWS/Gateway 是否开启，端口是否为 `4001` (Live) 或 `4002` (Paper)。确认 `ClientId` 不冲突。
 * **Data**: `MES` 显示为 `None`
     * **Check**: 检查是否为周末？如果是，请将 `DATA_MODE` 改为 `4`。检查是否购买了 "CME Real-Time" 数据包。
+* **Data**: 历史数据可用，但 `MES/USDCNH` 实时 tick 长时间为 `None`（`run_realtime.py` / 测试脚本均收不到实时）
+    * **First Check（第一优先）**: 请先确认 **IBKR Gateway 以“管理员权限”启动**。若未使用管理员权限，可能导致实时行情推送异常（表现为历史 K 线可拿到，但实时流无更新）。
+    * **处理建议**: 关闭当前 Gateway，使用“以管理员身份运行”重新启动后，再重连脚本验证实时 tick。
 
 ---
 

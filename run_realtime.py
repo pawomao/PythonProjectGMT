@@ -70,6 +70,9 @@ PREMIUM_NOTIFY_INTERVAL = 300
 MES_FX_STALE_TIMEOUT = 30     # MES / FX 超过该秒数无更新 => 认为 IB 通讯异常
 ETF_STALE_TIMEOUT = 60        # 单只 ETF 超过该秒数无 tick => 认为 QMT 该标的行情异常
 
+# 启动宽限期（秒）：主循环进入后，前 N 秒内若仅 MES/FX 实时为空，不报错只等待（IB 常先推 nan 再推有效价）
+REALTIME_GRACE_SEC = 20
+
 
 def set_error(message: str):
     """
@@ -251,7 +254,6 @@ def ib_loop():
         ib.reqMarketDataType(DATA_MODE)
         ib.reqMktData(MES_CONTRACT, '', False, False)
         ib.reqMktData(FOREX_CONTRACT, '', False, False)
-        print(f"✅ [IB线程] 实时数据流已建立")
 
         def on_pending_tickers(tickers):
             for t in tickers:
@@ -274,6 +276,12 @@ def ib_loop():
                         REALTIME_DATA['FX_TS'] = time.time()
 
         ib.pendingTickersEvent += on_pending_tickers
+        # 等待至少收到一次有效 MES+FX 再视为「已建立」（IB 常先推 nan，几秒后才推有效价）
+        for _ in range(20):
+            ib.waitOnUpdate(timeout=1)
+            if REALTIME_DATA.get('MES') and REALTIME_DATA.get('FX'):
+                break
+        print(f"✅ [IB线程] 实时数据流已建立")
         ib.run()
     except Exception as e:
         print(f"❌ [IB线程] 错误: {e}")
@@ -373,6 +381,7 @@ def main_monitor():
         print(f"   ✅ {code}: NAV={nav_val:.4f} (日期: {baseline_date})")
 
     print("\n✅ 系统运行中... (每3秒刷新)\n")
+    main_loop_start_ts = time.time()  # 用于启动宽限期，避免刚启动就因 MES/FX 未到而报错
 
     while True:
         try:
@@ -395,9 +404,14 @@ def main_monitor():
 
             # 1) 基础空值检查（包括启动阶段）
             if not (mes_curr and fx_curr and mes_base and fx_base):
-                set_error(f"基准/实时数据缺失：MES={mes_curr}, FX={fx_curr}, MES_CLOSE={mes_base}, FX_CLOSE={fx_base}")
-                maybe_notify_error()
-                print(f"⏳ 等待数据... (MES:{mes_curr} FX:{fx_curr})")
+                # 启动宽限期：基准已有、仅实时 MES/FX 未到时不报错（IB 常先推 nan 再推有效价）
+                in_grace = (mes_base and fx_base) and (time.time() - main_loop_start_ts < REALTIME_GRACE_SEC)
+                if in_grace:
+                    print(f"⏳ 等待 IB 实时数据... (MES:{mes_curr} FX:{fx_curr})")
+                else:
+                    set_error(f"基准/实时数据缺失：MES={mes_curr}, FX={fx_curr}, MES_CLOSE={mes_base}, FX_CLOSE={fx_base}")
+                    maybe_notify_error()
+                    print(f"⏳ 等待数据... (MES:{mes_curr} FX:{fx_curr})")
                 time.sleep(3)
                 continue
 
