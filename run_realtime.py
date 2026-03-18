@@ -18,7 +18,7 @@ import utils_contract
 import notifier
 
 # ================= ⚙️ 配置区域 =================
-IB_PORT = 4002
+IB_PORT = 4003
 IB_CLIENT_ID = 100
 DATA_MODE = 1  # 1=实时, 4=周末测试
 
@@ -221,86 +221,143 @@ def ib_loop():
     """IB 专用子线程"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    ib = IB()
-    try:
-        host = '127.0.0.1'
-        ib.RequestTimeout = 30
 
-        # IB API 连接可能在启动阶段短暂不可用（Gateway 尚未完全就绪/重启中）。
-        # 这里必须重试，避免一次 ConnectionRefused 就让 IB 线程退出，导致主程序“永远拿不到 MES/FX”。
-        while True:
+    # 当无法获得 MES/FX（包括断线/心跳超时/长期为 None）时，
+    # 不允许 ib_loop 线程退出；必须每 60 秒尝试重新连接 Gateway。
+    IB_RECONNECT_INTERVAL_SEC = 60
+    last_reconnect_attempt_ts = 0.0
+
+    while True:
+        # 控制重连频率，避免异常情况下过于频繁重连。
+        now_ts = time.time()
+        if last_reconnect_attempt_ts and (now_ts - last_reconnect_attempt_ts) < IB_RECONNECT_INTERVAL_SEC:
+            time.sleep(IB_RECONNECT_INTERVAL_SEC - (now_ts - last_reconnect_attempt_ts))
+
+        last_reconnect_attempt_ts = time.time()
+        ib = IB()
+        try:
+            host = '127.0.0.1'
+            ib.RequestTimeout = 30
+
+            # IB API 连接可能在启动阶段短暂不可用（Gateway 尚未完全就绪/重启中）。
+            # 这里继续重试，直到连上为止；外层会通过 IB_RECONNECT_INTERVAL_SEC 控制重连频率。
+            while True:
+                try:
+                    print(f"🔌 [IB线程] 尝试连接 IB API: {host}:{IB_PORT} (clientId={IB_CLIENT_ID}) ...")
+                    ib.connect(host, IB_PORT, clientId=IB_CLIENT_ID, timeout=15)
+                    break
+                except Exception as e:
+                    msg = f"IB API 连接失败（{host}:{IB_PORT}）：{e}"
+                    print(f"❌ [IB线程] {msg}")
+                    set_error(msg)
+                    maybe_notify_error()
+                    time.sleep(IB_RECONNECT_INTERVAL_SEC)
+
+            # A. 等待主线程计算出共同交易日候选列表
+            print("⏳ [IB线程] 等待共同交易日候选列表就绪...")
+            while not BASE_DATA.get('CANDIDATE_DATES'):
+                time.sleep(1)
+
+            # B. 按候选日期从新到旧逐日回退，直到同时锁定 MES/FX 同日收盘价
+            # 如果已经锁定过基准（例如重连发生在运行中），则无需重复计算。
+            if not (BASE_DATA.get('BASELINE_READY') and BASE_DATA.get('MES_CLOSE') and BASE_DATA.get('FX_CLOSE') and BASE_DATA.get('NAV_DATE')):
+                locked = False
+                for d in BASE_DATA['CANDIDATE_DATES']:
+                    mes_close, fx_close = get_historical_baseline(ib, d)
+                    if mes_close is not None and fx_close is not None:
+                        BASE_DATA['NAV_DATE'] = d
+                        BASE_DATA['MES_CLOSE'] = mes_close
+                        BASE_DATA['FX_CLOSE'] = fx_close
+                        BASE_DATA['BASELINE_READY'] = True
+                        print(f"🎯 [IB线程] 锚点日期锁定为: {d} | MES_CLOSE={mes_close} | FX_CLOSE={fx_close}")
+                        locked = True
+                        break
+
+                if not locked:
+                    msg = "IB 历史基准价获取失败：候选日期内无法锁定同日 MES/FX 收盘价。"
+                    print(f"❌ [IB线程] 致命错误: {msg}")
+                    set_error(msg)
+
+            # C. 订阅实时（每次重连都重新订阅，避免旧会话失效）
+            REALTIME_DATA['MES'] = None
+            REALTIME_DATA['MES_TS'] = 0.0
+            REALTIME_DATA['FX'] = None
+            REALTIME_DATA['FX_TS'] = 0.0
+
+            ib.reqMarketDataType(DATA_MODE)
+            ib.reqMktData(MES_CONTRACT, '', False, False)
+            ib.reqMktData(FOREX_CONTRACT, '', False, False)
+
+            def on_pending_tickers(tickers):
+                for t in tickers:
+                    # 若 MES / FX 仍为空，打印有限的调试信息，帮助确认 IB 是否有推行情
+                    if REALTIME_DATA['MES'] is None or REALTIME_DATA['FX'] is None:
+                        print(f"[IB线程][TICK] contract={t.contract}, last={t.last}, marketPrice={t.marketPrice()}")
+
+                    if t.contract.conId == MES_CONTRACT.conId:
+                        # 优先取 Last (防CME故障)
+                        price = t.last if (t.last and t.last > 0) else t.marketPrice()
+                        if price and price > 0:
+                            REALTIME_DATA['MES'] = price
+                            REALTIME_DATA['MES_TS'] = time.time()
+
+                    # 使用 conId 精确匹配 USDCNH 合约，避免仅按 symbol 判断带来的错配
+                    elif t.contract.conId == FOREX_CONTRACT.conId:
+                        price = t.marketPrice()
+                        if price and price > 0:
+                            REALTIME_DATA['FX'] = price
+                            REALTIME_DATA['FX_TS'] = time.time()
+
+            ib.pendingTickersEvent += on_pending_tickers
+
+            # 等待至少收到一次有效 MES+FX 再视为「已建立」（IB 常先推 nan，几秒后才推有效价）
+            for _ in range(20):
+                ib.waitOnUpdate(timeout=1)
+                if REALTIME_DATA.get('MES') and REALTIME_DATA.get('FX'):
+                    break
+            print(f"✅ [IB线程] 实时数据流已建立")
+
+            # 进入轮询模式：当长时间无法获得 MES/FX 或心跳超时，则回到外层重连循环。
+            while ib.isConnected():
+                ib.waitOnUpdate(timeout=1)
+
+                now_ts = time.time()
+                mes_ts = REALTIME_DATA.get('MES_TS') or 0.0
+                fx_ts = REALTIME_DATA.get('FX_TS') or 0.0
+                missing_or_stale = (
+                    REALTIME_DATA.get('MES') is None
+                    or REALTIME_DATA.get('FX') is None
+                    or (now_ts - mes_ts > MES_FX_STALE_TIMEOUT)
+                    or (now_ts - fx_ts > MES_FX_STALE_TIMEOUT)
+                )
+
+                # 只有当满足重连间隔时才执行重连，保证“每 60 秒一次”。
+                if missing_or_stale:
+                    if now_ts - last_reconnect_attempt_ts >= IB_RECONNECT_INTERVAL_SEC:
+                        print("⏳ [IB线程] 检测到 MES/FX 缺失或心跳超时，准备 60 秒节流后重连...")
+                        break
+        except Exception as e:
+            print(f"❌ [IB线程] 错误: {e}")
+            set_error(f"IB线程异常: {e}")
+            maybe_notify_error()
+        finally:
             try:
-                print(f"🔌 [IB线程] 尝试连接 IB API: {host}:{IB_PORT} (clientId={IB_CLIENT_ID}) ...")
-                ib.connect(host, IB_PORT, clientId=IB_CLIENT_ID, timeout=15)
-                break
-            except Exception as e:
-                msg = f"IB API 连接失败（{host}:{IB_PORT}）：{e}"
-                print(f"❌ [IB线程] {msg}")
-                set_error(msg)
-                maybe_notify_error()
-                time.sleep(5)
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
 
-        # A. 等待主线程计算出共同交易日候选列表
-        print("⏳ [IB线程] 等待共同交易日候选列表就绪...")
-        while not BASE_DATA.get('CANDIDATE_DATES'):
+            # 不关闭 asyncio loop：线程常驻，用外层 while True 控制重连节奏。
+            # loop.close() 放在进程退出时再统一处理。
+            try:
+                if REALTIME_DATA.get('MES') is None or REALTIME_DATA.get('FX') is None:
+                    # 如果确实缺数据，确保外层按 60 秒间隔再试。
+                    pass
+            except Exception:
+                pass
+
+            # 让出一点时间，避免紧密循环（重连节流由 last_reconnect_attempt_ts 控制）。
             time.sleep(1)
-
-        # B. 按候选日期从新到旧逐日回退，直到同时锁定 MES/FX 同日收盘价
-        locked = False
-        for d in BASE_DATA['CANDIDATE_DATES']:
-            mes_close, fx_close = get_historical_baseline(ib, d)
-            if mes_close is not None and fx_close is not None:
-                BASE_DATA['NAV_DATE'] = d
-                BASE_DATA['MES_CLOSE'] = mes_close
-                BASE_DATA['FX_CLOSE'] = fx_close
-                BASE_DATA['BASELINE_READY'] = True
-                print(f"🎯 [IB线程] 锚点日期锁定为: {d} | MES_CLOSE={mes_close} | FX_CLOSE={fx_close}")
-                locked = True
-                break
-
-        if not locked:
-            msg = "IB 历史基准价获取失败：候选日期内无法锁定同日 MES/FX 收盘价。"
-            print(f"❌ [IB线程] 致命错误: {msg}")
-            set_error(msg)
-
-        # C. 订阅实时
-        ib.reqMarketDataType(DATA_MODE)
-        ib.reqMktData(MES_CONTRACT, '', False, False)
-        ib.reqMktData(FOREX_CONTRACT, '', False, False)
-
-        def on_pending_tickers(tickers):
-            for t in tickers:
-                # 若 MES / FX 仍为空，打印有限的调试信息，帮助确认 IB 是否有推行情
-                if REALTIME_DATA['MES'] is None or REALTIME_DATA['FX'] is None:
-                    print(f"[IB线程][TICK] contract={t.contract}, last={t.last}, marketPrice={t.marketPrice()}")
-
-                if t.contract.conId == MES_CONTRACT.conId:
-                    # 优先取 Last (防CME故障)
-                    price = t.last if (t.last and t.last > 0) else t.marketPrice()
-                    if price and price > 0:
-                        REALTIME_DATA['MES'] = price
-                        REALTIME_DATA['MES_TS'] = time.time()
-
-                # 使用 conId 精确匹配 USDCNH 合约，避免仅按 symbol 判断带来的错配
-                elif t.contract.conId == FOREX_CONTRACT.conId:
-                    price = t.marketPrice()
-                    if price and price > 0:
-                        REALTIME_DATA['FX'] = price
-                        REALTIME_DATA['FX_TS'] = time.time()
-
-        ib.pendingTickersEvent += on_pending_tickers
-        # 等待至少收到一次有效 MES+FX 再视为「已建立」（IB 常先推 nan，几秒后才推有效价）
-        for _ in range(20):
-            ib.waitOnUpdate(timeout=1)
-            if REALTIME_DATA.get('MES') and REALTIME_DATA.get('FX'):
-                break
-        print(f"✅ [IB线程] 实时数据流已建立")
-        ib.run()
-    except Exception as e:
-        print(f"❌ [IB线程] 错误: {e}")
-    finally:
-        if ib.isConnected(): ib.disconnect()
-        loop.close()
 
 
 def main_monitor():

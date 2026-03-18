@@ -92,6 +92,10 @@ $$\text{Fair Value} = \text{NAV}_{date} \times \left( \frac{\text{MES}_{realtime
     * 一旦心跳超时：
         * 主线程通过 `set_error(...)` 进入“错误状态”，错误信息中明确标出超时标的与最后更新时间。
         * 继续运行进程，但暂停溢价率计算与估值摘要推送，仅保留错误告警。
+* **IB 断线/数据缺失重连策略**：
+    * `ib_loop` 线程在运行过程中若出现断线、异常退出或长期无法获取 `REALTIME_DATA['MES'] / REALTIME_DATA['FX']`（心跳超时或仍为 `None`）时，**不得退出线程**。
+    * 必须进入重连循环：当无法获得 MES/FX 时，按固定间隔 **每 60 秒**（`IB_RECONNECT_INTERVAL_SEC` 默认 60）尝试重新连接 IB Gateway。
+    * 每次重连需重新发起 `reqMarketDataType` / `reqMktData` 订阅，并重新等待 MES/FX 数据流建立。
 
 ### 3.3 数据对齐
 * **QMT**: 返回的是北京时间。
