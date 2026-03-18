@@ -18,7 +18,7 @@ import utils_contract
 import notifier
 
 # ================= ⚙️ 配置区域 =================
-IB_PORT = 4003
+IB_PORT = 4002
 IB_CLIENT_ID = 100
 DATA_MODE = 1  # 1=实时, 4=周末测试
 
@@ -223,9 +223,22 @@ def ib_loop():
     asyncio.set_event_loop(loop)
     ib = IB()
     try:
-        print(f"🔌 [IB线程] 连接端口 {IB_PORT}...")
-        ib.connect('127.0.0.1', IB_PORT, clientId=IB_CLIENT_ID)
+        host = '127.0.0.1'
         ib.RequestTimeout = 30
+
+        # IB API 连接可能在启动阶段短暂不可用（Gateway 尚未完全就绪/重启中）。
+        # 这里必须重试，避免一次 ConnectionRefused 就让 IB 线程退出，导致主程序“永远拿不到 MES/FX”。
+        while True:
+            try:
+                print(f"🔌 [IB线程] 尝试连接 IB API: {host}:{IB_PORT} (clientId={IB_CLIENT_ID}) ...")
+                ib.connect(host, IB_PORT, clientId=IB_CLIENT_ID, timeout=15)
+                break
+            except Exception as e:
+                msg = f"IB API 连接失败（{host}:{IB_PORT}）：{e}"
+                print(f"❌ [IB线程] {msg}")
+                set_error(msg)
+                maybe_notify_error()
+                time.sleep(5)
 
         # A. 等待主线程计算出共同交易日候选列表
         print("⏳ [IB线程] 等待共同交易日候选列表就绪...")
